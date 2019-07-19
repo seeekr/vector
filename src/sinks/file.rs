@@ -1,5 +1,6 @@
 use crate::{
     buffers::Acker,
+    event::Event,
     sinks::util::{
         encoding::{self, BasicEncoding},
         SinkExt,
@@ -9,7 +10,7 @@ use crate::{
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use futures::{future, try_ready, Async, AsyncSink, Future, Poll, Sink, StartSend};
 use tokio::codec::{BytesCodec, FramedWrite};
@@ -38,18 +39,11 @@ impl crate::topology::config::SinkConfig for FileSinkConfig {
     fn build(&self, acker: Acker) -> Result<(super::RouterSink, super::Healthcheck), String> {
         let encoding = self.encoding.clone();
 
-        let healthcheck = file_healthcheck(&self.path);
-
-        let path = self
-            .path
-            .canonicalize()
-            .map_err(|err| format!("Cannot canonicalize path {:?}: {}", self.path, err));
-
-        let sink = FileSink::new(path?)
+        let sink = FileSink::new(self.path.clone())
             .stream_ack(acker)
             .with(move |event| encoding::log_event_as_bytes_with_nl(event, &encoding));
 
-        Ok((Box::new(sink), healthcheck))
+        Ok((Box::new(sink), Box::new(future::ok(()))))
     }
 
     fn input_type(&self) -> DataType {
@@ -57,16 +51,8 @@ impl crate::topology::config::SinkConfig for FileSinkConfig {
     }
 }
 
-pub fn file_healthcheck(path: &Path) -> super::Healthcheck {
-    Box::new(if path.exists() {
-        future::ok(())
-    } else {
-        future::err("File doesn't exist.".to_string())
-    })
-}
-
 pub struct FileSink {
-    path: PathBuf,
+    pub path: PathBuf,
     state: FileSinkState,
 }
 
@@ -76,21 +62,34 @@ enum FileSinkState {
     FileProvided(FramedWrite<File, BytesCodec>),
 }
 
+impl FileSinkState {
+    fn init(path: PathBuf) -> Self {
+        debug!(message = "creating file", path = ?path.clone());
+        FileSinkState::CreatingFile(File::create(path))
+    }
+}
+
+pub type EmbeddedFileSink = Box<Sink<SinkItem = Event, SinkError = ()>>;
+
 impl FileSink {
     pub fn new(path: PathBuf) -> Self {
         Self {
-            path: path,
-            state: FileSinkState::Disconnected,
+            path: path.clone(),
+            state: FileSinkState::init(path),
         }
+    }
+
+    pub fn new_with_encoding(path: PathBuf, encoding: Option<BasicEncoding>) -> EmbeddedFileSink {
+        let sink = FileSink::new(path)
+            .with(move |event| encoding::log_event_as_bytes_with_nl(event, &encoding));
+
+        Box::new(sink)
     }
 
     pub fn poll_file(&mut self) -> Poll<&mut FramedWrite<File, BytesCodec>, ()> {
         loop {
             match self.state {
-                FileSinkState::Disconnected => {
-                    debug!(message = "creating file", path = ?self.path);
-                    self.state = FileSinkState::CreatingFile(resolve_and_create(self.path.clone()));
-                }
+                FileSinkState::Disconnected => return Err(()),
                 FileSinkState::CreatingFile(ref mut create_future) => match create_future.poll() {
                     Ok(Async::Ready(file)) => {
                         debug!(message = "created", file = ?file);
@@ -102,7 +101,6 @@ impl FileSink {
                         error!("Error creating file {:?}: {}", self.path, err);
                         self.state = FileSinkState::Disconnected;
 
-                        //todo: when dynamic paths will be introduced, it possibly will make sense to perform back-off
                         return Err(());
                     }
                 },
@@ -110,11 +108,6 @@ impl FileSink {
             }
         }
     }
-}
-
-fn resolve_and_create(path: PathBuf) -> CreateFuture<PathBuf> {
-    //todo: interpolation
-    File::create(path)
 }
 
 impl Sink for FileSink {
@@ -147,9 +140,8 @@ impl Sink for FileSink {
     }
 
     fn poll_complete(&mut self) -> Result<Async<()>, Self::SinkError> {
-        // We want to create the file only after receiving first event
         if let FileSinkState::Disconnected = self.state {
-            return Ok(Async::Ready(()));
+            return Err(());
         }
 
         let file = try_ready!(self.poll_file());
